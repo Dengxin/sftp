@@ -1,6 +1,6 @@
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
@@ -230,7 +230,10 @@ fn handle_client(stream: TcpStream, config: Arc<ServerConfig>) -> Result<()> {
                 let control_addr = writer
                     .local_addr()
                     .context("Unable to fetch control connection address")?;
-                match enter_passive_mode(control_addr) {
+                let peer_addr = writer
+                    .peer_addr()
+                    .context("Unable to fetch client address")?;
+                match enter_passive_mode(control_addr, peer_addr) {
                     Ok(listener) => {
                         let reply = format!(
                             "{},{},{},{},{},{}",
@@ -548,17 +551,20 @@ fn resolve_path(root: &Path, current: &Path, raw_path: &str) -> Result<PathBuf> 
     Ok(candidate)
 }
 
-fn enter_passive_mode(control_addr: SocketAddr) -> Result<PassiveListener> {
-    let reply_ip = match control_addr {
-        SocketAddr::V4(addr) => {
-            let ip = *addr.ip();
-            if ip.is_unspecified() {
-                Ipv4Addr::LOCALHOST
+fn enter_passive_mode(control_addr: SocketAddr, peer_addr: SocketAddr) -> Result<PassiveListener> {
+    let reply_ip = match (control_addr, peer_addr) {
+        (SocketAddr::V4(local), SocketAddr::V4(peer)) => {
+            resolve_passive_reply_ip(*local.ip(), *peer.ip(), peer.port())?
+        }
+        (SocketAddr::V4(local), SocketAddr::V6(_)) => {
+            let ip = *local.ip();
+            if ip.is_unspecified() || ip.is_loopback() {
+                bail!("IPv6 clients require EPSV");
             } else {
                 ip
             }
         }
-        SocketAddr::V6(_) => {
+        (SocketAddr::V6(_), _) => {
             bail!("IPv6 control connections are not supported");
         }
     };
@@ -667,4 +673,31 @@ fn receive_file(path: &Path, data_stream: &mut TcpStream) -> Result<()> {
     std::io::copy(data_stream, &mut file)?;
     file.flush()?;
     Ok(())
+}
+
+fn resolve_passive_reply_ip(
+    local_ip: Ipv4Addr,
+    peer_ip: Ipv4Addr,
+    peer_port: u16,
+) -> Result<Ipv4Addr> {
+    if !local_ip.is_unspecified() && !local_ip.is_loopback() {
+        return Ok(local_ip);
+    }
+
+    let udp = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
+        .context("Failed to bind helper UDP socket for PASV detection")?;
+    udp.connect(SocketAddr::new(IpAddr::V4(peer_ip), peer_port))
+        .context("Failed to connect helper UDP socket to client")?;
+    let bound_addr = udp
+        .local_addr()
+        .context("Failed to read helper UDP socket address")?;
+
+    if let SocketAddr::V4(bound_v4) = bound_addr {
+        let candidate = *bound_v4.ip();
+        if !candidate.is_unspecified() && !candidate.is_loopback() {
+            return Ok(candidate);
+        }
+    }
+
+    bail!("Unable to determine a routable IPv4 address for passive mode");
 }
